@@ -55,3 +55,8 @@ docs/_build/
 
 # PyBuilder
 target/
+
+#train file
+ptb.test.txt
+ptb.train.txt
+ptb.valid.txt
