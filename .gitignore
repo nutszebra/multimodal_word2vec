@@ -60,3 +60,4 @@ target/
 ptb.test.txt
 ptb.train.txt
 ptb.valid.txt
+/word2vec/cifar-100-python
