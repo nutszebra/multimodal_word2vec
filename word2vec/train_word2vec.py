@@ -19,7 +19,7 @@ import chainer.optimizers as O
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
-parser.add_argument('--unit', '-u', default=100, type=int,
+parser.add_argument('--unit', '-u', default=300, type=int,
                     help='number of units')
 parser.add_argument('--window', '-w', default=5, type=int,
                     help='window size')
@@ -31,7 +31,7 @@ parser.add_argument('--model', '-m', choices=['skipgram', 'cbow'],
                     default='skipgram',
                     help='model type ("skipgram", "cbow")')
 parser.add_argument('--out-type', '-o', choices=['hsm', 'ns', 'original'],
-                    default='hsm',
+                    default='ns',
                     help='output model type ("hsm": hierarchical softmax, '
                     '"ns": negative sampling, "original": no approximation)')
 args = parser.parse_args()
@@ -95,10 +95,18 @@ class SoftmaxCrossEntropyLoss(chainer.Chain):
         return F.softmax_cross_entropy(self.W(x), t)
 
 
-def calculate_loss(model, dataset, offset):
+#def calculate_loss(model, dataset, offset):
+def calculate_loss(model, dataset, position):
     # use random window size in the same way as the original word2vec
     # implementation.
     w = np.random.randint(args.window - 1) + 1
+"""
+In [21]: np.random.randint(5 - 1) + 1
+Out[21]: 4
+
+In [22]: np.random.randint(5 - 1) + 1
+Out[22]: 2
+"""
     context = []
     for offset in range(-w, w + 1):
         if offset == 0:
@@ -108,6 +116,22 @@ def calculate_loss(model, dataset, offset):
         context.append(c)
     x_data = xp.asarray(dataset[position])
     x = chainer.Variable(x_data)
+"""
+dataset = [9, 0, 8, 6, 2, 7, 5, 3, 4, 1]
+position=[3, 7]
+w = 2
+offset in [-2, -1, 0, 1, 2]
+if offset = -1
+n [59]: xp.asarray(dataset[position + -1])
+Out[59]: array([8, 5])
+
+final result of context is:
+In [69]: context
+Out[69]: [array([0, 7]), array([8, 5]), array([2, 4]), array([7, 1])]
+
+x is:
+array([6, 3])
+"""
     return model(x, context)
 
 
@@ -125,8 +149,19 @@ with open('ptb.train.txt') as f:
                 ind = len(word2index)
                 word2index[word] = ind
                 index2word[ind] = word
+#count how many times word, variable in here, appeared
+#If the word of "metropolis" appears in ptb.train.txt only once, count is going to be 1
             counts[word2index[word]] += 1
+#append index number of words
             dataset.append(word2index[word])
+"""if document like this:
+apple apple orange orange water apple
+
+word2index = {"apple": 1, "orange": 2, "water": 3}
+index2word = {1: "apple", 2: "orange", 3: "water"}
+counts = {1: 3, 2: 2, 3: 1}
+dataset = [1 1 2 2 3 1]
+"""
 
 n_vocab = len(word2index)
 
@@ -138,8 +173,13 @@ if args.out_type == 'hsm':
     tree = HSM.create_huffman_tree(counts)
     loss_func = HSM(args.unit, tree)
 elif args.out_type == 'ns':
+"""
+the structure of cs is same as the variable counts
+just it's converted from collenctions to array
+"""
     cs = [counts[w] for w in range(len(counts))]
     loss_func = L.NegativeSampling(args.unit, cs, 20)
+#args.unit is dimension of words
 elif args.out_type == 'original':
     loss_func = SoftmaxCrossEntropyLoss(args.unit, n_vocab)
 else:
@@ -163,11 +203,21 @@ optimizer.setup(model)
 begin_time = time.time()
 cur_at = begin_time
 word_count = 0
+"""
+len(dataset) = 10000
+args.window = 5
+args.batchsize = 100
+skip = (10000 - 5 * 2) // 100 = 99
+"""
 skip = (len(dataset) - args.window * 2) // args.batchsize
 next_count = 100000
 for epoch in range(args.epoch):
     accum_loss = 0
     print('epoch: {0}'.format(epoch))
+"""
+In [8]: np.random.permutation(10)
+Out[8]: array([3, 1, 6, 5, 8, 4, 0, 2, 7, 9])
+"""
     indexes = np.random.permutation(skip)
     for i in indexes:
         if word_count >= next_count:
@@ -179,6 +229,25 @@ for epoch in range(args.epoch):
             next_count += 100000
             cur_at = now
 
+"""
+len(dataset) = 10000
+args.window = 5
+args.batchsize = 100
+skip = (10000 - 5 * 2) // 100 = 99
+indexes = [3 4 13 ... 92] #len(indexes) = 99
+i = 3
+position = np.array(range(0, 100)) * 99 + (5 + 3)
+         = array([   8,  107,  206,  305,  404,  503,  602,  701,  800,  899,  998,
+           1097, 1196, 1295, 1394, 1493, 1592, 1691, 1790, 1889, 1988, 2087,
+           2186, 2285, 2384, 2483, 2582, 2681, 2780, 2879, 2978, 3077, 3176,
+           3275, 3374, 3473, 3572, 3671, 3770, 3869, 3968, 4067, 4166, 4265,
+           4364, 4463, 4562, 4661, 4760, 4859, 4958, 5057, 5156, 5255, 5354,
+           5453, 5552, 5651, 5750, 5849, 5948, 6047, 6146, 6245, 6344, 6443,
+           6542, 6641, 6740, 6839, 6938, 7037, 7136, 7235, 7334, 7433, 7532,
+           7631, 7730, 7829, 7928, 8027, 8126, 8225, 8324, 8423, 8522, 8621,
+           8720, 8819, 8918, 9017, 9116, 9215, 9314, 9413, 9512, 9611, 9710,
+           9809])
+"""
         position = np.array(
             range(0, args.batchsize)) * skip + (args.window + i)
         loss = calculate_loss(model, dataset, position)
