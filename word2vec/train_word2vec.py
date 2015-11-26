@@ -9,17 +9,18 @@ import collections
 import time
 
 import numpy as np
+import six.moves.cPickle as pickle
+import random
 
 import chainer
 from chainer import cuda
 import chainer.functions as F
-import chainer.links as L
 import chainer.optimizers as O
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', '-g', default=-1, type=int,
                     help='GPU ID (negative value indicates CPU)')
-parser.add_argument('--unit', '-u', default=300, type=int,
+parser.add_argument('--unit', '-u', default=100, type=int,
                     help='number of units')
 parser.add_argument('--window', '-w', default=5, type=int,
                     help='window size')
@@ -31,9 +32,14 @@ parser.add_argument('--model', '-m', choices=['skipgram', 'cbow'],
                     default='skipgram',
                     help='model type ("skipgram", "cbow")')
 parser.add_argument('--out-type', '-o', choices=['hsm', 'ns', 'original'],
-                    default='ns',
+                    default='hsm',
                     help='output model type ("hsm": hierarchical softmax, '
                     '"ns": negative sampling, "original": no approximation)')
+parser.add_argument('--nsnv', '-v', default=5, type=int,
+                    help='the number of negative sampling about vision')
+parser.add_argument('--l1', '-l', default=0.0001, 
+                    help='hyper parameter for L1 norm')
+
 args = parser.parse_args()
 if args.gpu >= 0:
     cuda.check_cuda_available()
@@ -46,93 +52,71 @@ print('Minibatch-size: {}'.format(args.batchsize))
 print('# epoch: {}'.format(args.epoch))
 print('Training model: {}'.format(args.model))
 print('Output type: {}'.format(args.out_type))
+print('the number of negative sampling about vision: {}'.format(args.nsnv))
+print('hyper parameter for L1 norm: {}'.format(args.l1))
 print('')
 
 
-class ContinuousBoW(chainer.Chain):
+def continuous_bow(dataset, position):
+    h = None
 
-    def __init__(self, n_vocab, n_units, loss_func):
-        super(ContinuousBoW, self).__init__(
-            embed=F.EmbedID(n_vocab, args.unit),
-            loss_func=loss_func,
-        )
-
-    def __call__(self, x, context):
-        h = None
-        for c in context:
-            e = self.embed(c)
-            h = h + e if h is not None else e
-
-        return self.loss_func(h, x)
-
-
-class SkipGram(chainer.Chain):
-
-    def __init__(self, n_vocab, n_units, loss_func):
-        super(SkipGram, self).__init__(
-            embed=L.EmbedID(n_vocab, n_units),
-            loss_func=loss_func,
-        )
-
-    def __call__(self, x, context):
-        loss = None
-        for c in context:
-            e = self.embed(c)
-
-            loss_i = self.loss_func(e, x)
-            loss = loss_i if loss is None else loss + loss_i
-
-        return loss
-
-
-class SoftmaxCrossEntropyLoss(chainer.Chain):
-    def __init__(self, n_in, n_out):
-        super(SoftmaxCrossEntropyLoss, self).__init__(
-            W=L.Linear(n_in, n_out),
-        )
-
-    def __call__(self, x, t):
-        return F.softmax_cross_entropy(self.W(x), t)
-
-
-#def calculate_loss(model, dataset, offset):
-def calculate_loss(model, dataset, position):
     # use random window size in the same way as the original word2vec
     # implementation.
     w = np.random.randint(args.window - 1) + 1
-"""
-In [21]: np.random.randint(5 - 1) + 1
-Out[21]: 4
-
-In [22]: np.random.randint(5 - 1) + 1
-Out[22]: 2
-"""
-    context = []
     for offset in range(-w, w + 1):
         if offset == 0:
             continue
-        c_data = xp.asarray(dataset[position + offset])
-        c = chainer.Variable(c_data)
-        context.append(c)
-    x_data = xp.asarray(dataset[position])
-    x = chainer.Variable(x_data)
-"""
-dataset = [9, 0, 8, 6, 2, 7, 5, 3, 4, 1]
-position=[3, 7]
-w = 2
-offset in [-2, -1, 0, 1, 2]
-if offset = -1
-n [59]: xp.asarray(dataset[position + -1])
-Out[59]: array([8, 5])
+        d = xp.asarray(dataset[position + offset])
+        x = chainer.Variable(d)
+        e = model.embed(x)
+        h = h + e if h is not None else e
 
-final result of context is:
-In [69]: context
-Out[69]: [array([0, 7]), array([8, 5]), array([2, 4]), array([7, 1])]
+    d = xp.asarray(dataset[position])
+    t = chainer.Variable(d)
+    return loss_func(h, t)
 
-x is:
-array([6, 3])
-"""
-    return model(x, context)
+
+def skip_gram(dataset, position) :
+    d = xp.asarray(dataset[position])
+    t = chainer.Variable(d)
+
+    # use random window size in the same way as the original word2vec
+    # implementation.
+    w = np.random.randint(args.window - 1) + 1
+    loss = None
+    for offset in range(-w, w + 1):
+        if offset == 0:
+            continue
+        d = xp.asarray(dataset[position + offset])
+        x = chainer.Variable(d)
+        e = model.embed(x)
+
+        loss_i = loss_func(e, t)
+        loss = loss_i if loss is None else loss + loss_i
+
+    return loss
+
+def negative_sampling_vision(dataset, position, visual, visual_negative, negative_info, r=0.5):
+  d = xp.asarray(dataset[position])
+  t = chainer.Variable(d)
+  e = model.embed(t)
+  c = model.M(e)
+  weight = F.split_axis(c,len(c.data),axis=0)
+  loss = None
+  for info, i in zip(negative_info, range(len(negative_info))):
+    if info:
+      tmpLoss = None
+      v = chainer.Variable(np.array([visual[i]],dtype=np.float32))
+      cos_positive = F.sum(v * weight[i]) / chainer.Variable(np.array(np.linalg.norm(weight[i].data) * np.linalg.norm(v.data), dtype=np.float32))
+      for v_n in visual_negative[i]:
+        v_n = chainer.Variable(np.array([v_n],dtype=np.float32))
+        cos_negative =  F.sum(v_n * weight[i]) / chainer.Variable(np.array(np.linalg.norm(weight[i].data) * np.linalg.norm(v_n.data),dtype=np.float32))
+        tmpLoss = cos_negative if tmpLoss is None else tmpLoss + cos_negative
+      tmpLoss = F.relu(chainer.Variable(np.array(r,dtype=np.float32)) + tmpLoss - cos_positive)
+      loss = tmpLoss if loss is None else loss + tmpLoss
+    else:
+      continue
+  return loss
 
 
 if args.gpu >= 0:
@@ -149,48 +133,40 @@ with open('ptb.train.txt') as f:
                 ind = len(word2index)
                 word2index[word] = ind
                 index2word[ind] = word
-#count how many times word, variable in here, appeared
-#If the word of "metropolis" appears in ptb.train.txt only once, count is going to be 1
             counts[word2index[word]] += 1
-#append index number of words
             dataset.append(word2index[word])
-"""if document like this:
-apple apple orange orange water apple
-
-word2index = {"apple": 1, "orange": 2, "water": 3}
-index2word = {1: "apple", 2: "orange", 3: "water"}
-counts = {1: 3, 2: 2, 3: 1}
-dataset = [1 1 2 2 3 1]
-"""
 
 n_vocab = len(word2index)
 
 print('n_vocab: %d' % n_vocab)
 print('data length: %d' % len(dataset))
 
-if args.out_type == 'hsm':
-    HSM = L.BinaryHierarchicalSoftmax
-    tree = HSM.create_huffman_tree(counts)
-    loss_func = HSM(args.unit, tree)
-elif args.out_type == 'ns':
-"""
-the structure of cs is same as the variable counts
-just it's converted from collenctions to array
-"""
-    cs = [counts[w] for w in range(len(counts))]
-    loss_func = L.NegativeSampling(args.unit, cs, 20)
-#args.unit is dimension of words
-elif args.out_type == 'original':
-    loss_func = SoftmaxCrossEntropyLoss(args.unit, n_vocab)
-else:
-    raise Exception('Unknown output type: {}'.format(args.out_type))
-
 if args.model == 'skipgram':
-    model = SkipGram(n_vocab, args.unit, loss_func)
+    train_model = skip_gram
 elif args.model == 'cbow':
-    model = ContinuousBoW(n_vocab, args.unit, loss_func)
+    train_model = continuous_bow
 else:
     raise Exception('Unknown model type: {}'.format(args.model))
+
+model = chainer.FunctionSet(
+    embed=F.EmbedID(n_vocab, args.unit),
+    M=F.Linear(args.unit, 6272)
+)
+
+if args.out_type == 'hsm':
+    HSM = F.BinaryHierarchicalSoftmax
+    tree = HSM.create_huffman_tree(counts)
+    model.l = HSM(args.unit, tree)
+    loss_func = model.l
+elif args.out_type == 'ns':
+    cs = [counts[w] for w in range(len(counts))]
+    model.l = F.NegativeSampling(args.unit, cs, 20)
+    loss_func = model.l
+elif args.out_type == 'original':
+    model.l = F.Linear(args.unit, n_vocab)
+    loss_func = lambda h, t: F.softmax_cross_entropy(model.l(h), t)
+else:
+    raise Exception('Unknown output type: {}'.format(args.out_type))
 
 if args.gpu >= 0:
     model.to_gpu()
@@ -203,21 +179,57 @@ optimizer.setup(model)
 begin_time = time.time()
 cur_at = begin_time
 word_count = 0
-"""
-len(dataset) = 10000
-args.window = 5
-args.batchsize = 100
-skip = (10000 - 5 * 2) // 100 = 99
-"""
 skip = (len(dataset) - args.window * 2) // args.batchsize
 next_count = 100000
+
+def load_object(path):
+  with open(path, 'r') as f:
+    answer = pickle.load(f)
+  return answer
+
+def toRowVector(vec): 
+  dim = vec.shape 
+  rowDim = 1 
+  for d in dim: 
+    rowDim = rowDim * d
+  return vec.reshape(rowDim)
+
+visual_train = load_object("/mnt/s3pic/cifar10/smallTrain_y/pca/32/train_32.pkl")
+visual_tag = load_object("/mnt/s3pic/cifar10/smallTrain_y/pca/32/tag.pkl")
+visual_y = load_object("/mnt/s3pic/cifar10/smallTrain_y/train_y.pkl")
+visual_words = load_object("/mnt/s3pic/cifar10/smallTrain_y/words.pkl")
+
+visual_X = np.array(visual_train, dtype=np.float32)
+index2visual = {}
+
+count = 0
+for name in visual_tag:
+  filename = name.split("/")[-1]
+  pic_tag = visual_words[visual_y[filename]]
+  if pic_tag in word2index:
+    if word2index[pic_tag] in index2visual:
+      index2visual[word2index[pic_tag]].append(toRowVector(visual_X[count]))
+    else:
+      index2visual[word2index[pic_tag]] = [toRowVector(visual_X[count])]
+  count = count + 1
+zeroVector = index2visual[index2visual.keys()[0]][0] * 0
+
+negative_dict ={}
+
+for key in index2visual:
+  negative_dict[key] = []
+  for keykey in index2visual:
+    if key == keykey:
+      pass
+    else:
+      for i in xrange(len(index2visual[keykey])):
+        negative_dict[key].append((keykey, i))
+
+
 for epoch in range(args.epoch):
     accum_loss = 0
+    accum_loss_visual = 0
     print('epoch: {0}'.format(epoch))
-"""
-In [8]: np.random.permutation(10)
-Out[8]: array([3, 1, 6, 5, 8, 4, 0, 2, 7, 9])
-"""
     indexes = np.random.permutation(skip)
     for i in indexes:
         if word_count >= next_count:
@@ -229,40 +241,39 @@ Out[8]: array([3, 1, 6, 5, 8, 4, 0, 2, 7, 9])
             next_count += 100000
             cur_at = now
 
-"""
-len(dataset) = 10000
-args.window = 5
-args.batchsize = 100
-skip = (10000 - 5 * 2) // 100 = 99
-indexes = [3 4 13 ... 92] #len(indexes) = 99
-i = 3
-position = np.array(range(0, 100)) * 99 + (5 + 3)
-         = array([   8,  107,  206,  305,  404,  503,  602,  701,  800,  899,  998,
-           1097, 1196, 1295, 1394, 1493, 1592, 1691, 1790, 1889, 1988, 2087,
-           2186, 2285, 2384, 2483, 2582, 2681, 2780, 2879, 2978, 3077, 3176,
-           3275, 3374, 3473, 3572, 3671, 3770, 3869, 3968, 4067, 4166, 4265,
-           4364, 4463, 4562, 4661, 4760, 4859, 4958, 5057, 5156, 5255, 5354,
-           5453, 5552, 5651, 5750, 5849, 5948, 6047, 6146, 6245, 6344, 6443,
-           6542, 6641, 6740, 6839, 6938, 7037, 7136, 7235, 7334, 7433, 7532,
-           7631, 7730, 7829, 7928, 8027, 8126, 8225, 8324, 8423, 8522, 8621,
-           8720, 8819, 8918, 9017, 9116, 9215, 9314, 9413, 9512, 9611, 9710,
-           9809])
-"""
         position = np.array(
             range(0, args.batchsize)) * skip + (args.window + i)
-        loss = calculate_loss(model, dataset, position)
+        visual = np.array([random.sample(index2visual[key], 1)[0] if key in index2visual.keys() else zeroVector for key in dataset[position]], dtype=np.float32)
+        visual_negative = []
+        negative_info = []
+        for v, i in zip(visual, range(len(visual))):
+          if np.linalg.norm(zeroVector) == np.linalg.norm(v):
+            visual_negative.append(np.array([zeroVector for i in xrange(0,args.nsnv)], dtype=np.float32))
+            negative_info.append(False)
+          else:
+            negative_sample = random.sample(negative_dict[dataset[position][i]], args.nsnv)
+            visual_negative.append(np.array([index2visual[i[0]][i[1]] for i in negative_sample], dtype=np.float32))
+            negative_info.append(True)
+        visual_negative = np.array(visual_negative, dtype=np.float32)
+        loss = train_model(dataset, position)
+        loss_visual = negative_sampling_vision(dataset, position, visual, visual_negative, negative_info)
+        if loss_visual is None:
+          pass
+        else:
+          l1_norm = chainer.Variable(np.array(args.l1 * np.linalg.norm(model.M.W),dtype=np.float32))
+          loss = loss + loss_visual + l1_norm
         accum_loss += loss.data
+        accum_loss_visual = accum_loss_visual if loss_visual is None else accum_loss_visual + loss_visual.data + l1_norm.data
         word_count += args.batchsize
 
-        model.zerograds()
+        optimizer.zero_grads()
         loss.backward()
         optimizer.update()
 
     print(accum_loss)
+    print(accum_loss_visual)
 
-with open('word2vec.model', 'w') as f:
-    f.write('%d %d\n' % (len(index2word), args.unit))
-    w = model.embed.W.data
-    for i in range(w.shape[0]):
-        v = ' '.join(['%f' % v for v in w[i]])
-        f.write('%s %s\n' % (index2word[i], v))
+model.to_cpu()
+with open('model.pickle', 'wb') as f:
+    obj = (model, index2word, word2index)
+    pickle.dump(obj, f)
